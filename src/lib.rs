@@ -1,8 +1,8 @@
-mod beacon;
-
 use std::sync::{Arc, mpsc, Mutex};
 use std::sync::mpsc::SendError;
 use std::thread;
+
+pub mod beacon;
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
@@ -91,7 +91,7 @@ impl Worker {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-pub struct PoolCreationError {
+pub struct PoolCreationError<'a> {
     pub message: String
 }
 
