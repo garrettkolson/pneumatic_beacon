@@ -37,7 +37,17 @@ impl Beacon {
     }
 
     fn register_node(&self, request: NodeRequest) {
+        for node_type in request.requester_types {
+            let nodes = match node_type {
+                NodeRegistryType::Committer => Arc::clone(&self.committers),
+                NodeRegistryType::Sentinel => Arc::clone(&self.sentinels),
+                NodeRegistryType::Executor => Arc::clone(&self.executors),
+                NodeRegistryType::Finalizer => Arc::clone(&self.finalizers),
+                _ => continue
+            };
 
+            nodes.insert(request.requester_key.clone(), request.requester_ip.clone());
+        }
     }
 
     fn request_node(&self, request: NodeRequest) {
