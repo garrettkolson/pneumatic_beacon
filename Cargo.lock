@@ -105,13 +105,14 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 name = "pneumatic_beacon"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "pneumatic_core",
 ]
 
 [[package]]
 name = "pneumatic_core"
 version = "0.1.0"
-source = "git+https://github.com/garrettkolson/pneumatic_core.git#f24b29a7bdb1494d2abaa69f0a43a4fdcd7d7b6b"
+source = "git+https://github.com/garrettkolson/pneumatic_core.git#db4a2727c7ad6d410299fa43d7becac4e59f1777"
 dependencies = [
  "dashmap",
  "rmp-serde",

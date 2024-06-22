@@ -1,41 +1,96 @@
-use std::io::{BufReader};
-use std::net::TcpStream;
-use pneumatic_core::encoding;
-use pneumatic_core::node::{NodeRegistryRequest};
+use std::net::{Ipv6Addr, SocketAddrV6};
+use std::str::FromStr;
+use std::sync::Arc;
+use dashmap::DashMap;
+use pneumatic_core::{conns, encoding, node::*};
 
 pub struct Beacon {
-    nodes: Vec<Vec<u8>>
+    committers: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
+    sentinels: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
+    executors: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
+    finalizers: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
+    conn_factory: Box<dyn conns::ConnFactory>
 }
 
 impl Beacon {
-    pub fn from_config() -> Beacon {
+    pub fn with_factory(conn_factory: impl conns::ConnFactory) -> Beacon {
         Beacon {
-            nodes: Vec::new()
+            committers: Arc::new(DashMap::new()),
+            sentinels: Arc::new(DashMap::new()),
+            executors: Arc::new(DashMap::new()),
+            finalizers: Arc::new(DashMap::new()),
+            conn_factory
         }
     }
 
-    pub fn handle_request(&self, mut stream: TcpStream){
-        // todo: have to make methods both for registering with beacon
-        // todo: and for making a broadcast request
+    pub fn handle_request(&self, data: Vec<u8>){
+        // TODO: log failed deserializations
+        let request = match encoding::deserialize_rmp_to::<NodeRequest>(data) {
+            Ok(req) => req,
+            Err(_) => return
+        };
 
-        let buf_reader = BufReader::new(&mut stream);
-        let _ = encoding::deserialize_rmp_to::<NodeRegistryRequest>(buf_reader.buffer().to_vec());
+        match request.request_type {
+            NodeRequestType::Register => self.register_node(request),
+            NodeRequestType::Request => self.request_node(request)
+        }
+    }
 
-        // let request_line = buf_reader.lines().next().unwrap().unwrap();
-        //
-        // let (status_line, filename) = match &request_line[..] {
-        //     "GET / HTTP/1.1" => ("HTTP/1.1 200 OK", "hello.html"),
-        //     "GET /sleep HTTP/1.1" => {
-        //         thread::sleep(Duration::from_secs(5));
-        //         ("HTTP/1.1 200 OK", "hello.html")
-        //     }
-        //     _ => ("HTTP/1.1 404 Not Found", "404.html"),
-        // };
-        //
-        // let contents = fs::read_to_string(filename).unwrap();
-        // let length = contents.len();
-        //
-        // let response = format!("{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}");
-        // stream.write_all(response.as_bytes()).unwrap();
+    fn register_node(&self, request: NodeRequest) {
+
+    }
+
+    fn request_node(&self, request: NodeRequest) {
+        // TODO: log non-matched type requests
+        let (nodes, port) = match request.requested_type {
+            NodeRegistryType::Committer => (Arc::clone(&self.committers), conns::COMMITTER_PORT),
+            NodeRegistryType::Sentinel => (Arc::clone(&self.sentinels), conns::SENTINEL_PORT),
+            NodeRegistryType::Executor => (Arc::clone(&self.executors), conns::EXECUTOR_PORT),
+            NodeRegistryType::Finalizer => (Arc::clone(&self.finalizers), conns::FINALIZER_PORT),
+            _ => return
+        };
+
+        // TODO: log serialization errors
+        let data = match encoding::serialize_to_bytes_rmp(request) {
+            Ok(d) => d,
+            Err(_) => return
+        };
+
+        for node in nodes.iter() {
+            if let Ok(addr) = SocketAddrV6::new(node.value().clone(), port, 0, 0) {
+                let sender = self.conn_factory.get_faf_sender();
+                sender.send(addr, &*data);
+            }
+        }
+    }
+
+    // TODO: write heartbeat method to remove stale nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::ToSocketAddrs;
+    use pneumatic_core::conns::{ConnFactory, FireAndForgetSender};
+
+    // TODO: write the tests
+
+    pub struct SendFakeStuff {
+        sent: Option<Vec<u8>>
+    }
+
+    impl FireAndForgetSender for SendFakeStuff {
+        fn send(&self, addr: impl ToSocketAddrs, data: &[u8]) {
+            todo!()
+        }
+    }
+
+    pub struct FakeConnFactory { }
+
+    impl ConnFactory for FakeConnFactory {
+        fn get_faf_sender(&self) -> SendFakeStuff {
+            SendFakeStuff {
+                sent: None
+            }
+        }
     }
 }

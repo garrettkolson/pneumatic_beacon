@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 pneumatic_core = { git = "https://github.com/garrettkolson/pneumatic_core.git" }
+dashmap = "5.5.3"
