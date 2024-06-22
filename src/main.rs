@@ -12,7 +12,8 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:7878")
         .expect("Couldn't set up listener for beacon");
 
-    let beacon = Arc::new(Beacon::with_factory(TcpConnFactory::new()));
+    let conn_factory = Box::new(TcpConnFactory::new());
+    let beacon = Arc::new(Beacon::with_factory(conn_factory));
     let pool = match server::ThreadPool::build(THREAD_COUNT) {
         Err(err) => panic!("{}", err.message),
         Ok(p) => p

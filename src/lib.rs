@@ -9,17 +9,17 @@ pub struct Beacon {
     sentinels: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
     executors: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
     finalizers: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
-    conn_factory: Box<dyn conns::ConnFactory>
+    conn_factory: Arc<Box<dyn conns::ConnFactory>>
 }
 
 impl Beacon {
-    pub fn with_factory(conn_factory: impl conns::ConnFactory) -> Beacon {
+    pub fn with_factory(conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
         Beacon {
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
-            conn_factory
+            conn_factory: Arc::new(conn_factory)
         }
     }
 
@@ -57,10 +57,9 @@ impl Beacon {
         };
 
         for node in nodes.iter() {
-            if let Ok(addr) = SocketAddrV6::new(node.value().clone(), port, 0, 0) {
-                let sender = self.conn_factory.get_faf_sender();
-                sender.send(addr, &*data);
-            }
+            let addr = SocketAddrV6::new(node.value().clone(), port, 0, 0);
+            let sender = self.conn_factory.get_faf_sender();
+            sender.send_to_v6(addr, &*data);
         }
     }
 
@@ -69,7 +68,7 @@ impl Beacon {
 
 #[cfg(test)]
 mod tests {
-    use std::net::ToSocketAddrs;
+    use std::net::{SocketAddrV4, SocketAddrV6};
     use pneumatic_core::conns::{ConnFactory, FireAndForgetSender};
 
     // TODO: write the tests
@@ -79,7 +78,11 @@ mod tests {
     }
 
     impl FireAndForgetSender for SendFakeStuff {
-        fn send(&self, addr: impl ToSocketAddrs, data: &[u8]) {
+        fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]) {
+            todo!()
+        }
+
+        fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]) {
             todo!()
         }
     }
