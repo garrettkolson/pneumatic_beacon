@@ -73,7 +73,19 @@ impl Beacon {
         }
     }
 
-    // TODO: write heartbeat method to remove stale nodes
+    pub fn check_heartbeats(&self) -> HeartbeatResult {
+        HeartbeatResult::Ok
+    }
+}
+
+pub enum HeartbeatResult {
+    Ok,
+    Err(HeartbeatError)
+}
+
+pub enum HeartbeatError {
+    NoNodesConnected,
+    ConnectionError
 }
 
 #[cfg(test)]

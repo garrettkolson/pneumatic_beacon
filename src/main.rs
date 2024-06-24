@@ -1,20 +1,41 @@
 use std::io::BufReader;
 use std::net::{TcpListener};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime};
 use pneumatic_core::conns::TcpConnFactory;
 use pneumatic_core::server;
-use pneumatic_beacon::Beacon;
+use pneumatic_beacon::{Beacon, HeartbeatError, HeartbeatResult};
 
-const THREAD_COUNT: usize = 100;
+const SERVER_THREAD_COUNT: usize = 100;
+const HEARTBEAT_DURATION_IN_SECS: u64 = 60;
 
 fn main() {
+    let conn_factory = Box::new(TcpConnFactory::new());
+    let beacon = Arc::new(Beacon::with_factory(conn_factory));
+
+    // TODO: have to make a tx/rx to let either thread know if there's a problem with the other?
+    // TODO: or do we just panic?
+    let request_beacon = Arc::clone(&beacon);
+    let request_thread = thread::spawn(move || {
+        listen_for_requests(request_beacon);
+    });
+
+    let heartbeat_beacon = Arc::clone(&beacon);
+    let heartbeat_thread = thread::spawn(move || {
+        check_node_heartbeats(heartbeat_beacon);
+    });
+
+    request_thread.join().unwrap();
+    heartbeat_thread.join().unwrap();
+}
+
+fn listen_for_requests(beacon: Arc<Beacon>) {
     // todo: make listener address, thread count configurable by loading from config.json
     let listener = TcpListener::bind("127.0.0.1:7878")
         .expect("Couldn't set up listener for beacon");
 
-    let conn_factory = Box::new(TcpConnFactory::new());
-    let beacon = Arc::new(Beacon::with_factory(conn_factory));
-    let pool = match server::ThreadPool::build(THREAD_COUNT) {
+    let pool = match server::ThreadPool::build(SERVER_THREAD_COUNT) {
         Err(err) => panic!("{}", err.message),
         Ok(p) => p
     };
@@ -31,6 +52,27 @@ fn main() {
             },
             // TODO: log bad requests?
             Err(_) => continue
+        };
+    }
+}
+
+fn check_node_heartbeats(beacon: Arc<Beacon>) {
+    let mut checking = true;
+    let beacon_clone = Arc::clone(&beacon);
+
+    while checking {
+        let start = SystemTime::now();
+        match beacon_clone.check_heartbeats() {
+            HeartbeatResult::Err(HeartbeatError::ConnectionError) => checking = false,
+            _ => {
+                let mut remaining_time = HEARTBEAT_DURATION_IN_SECS;
+                if let Ok(elapsed) = start.elapsed() {
+                    let elapsed_secs = elapsed.as_secs();
+                    remaining_time = HEARTBEAT_DURATION_IN_SECS - elapsed_secs;
+                    if remaining_time < 0 { continue; }
+                }
+                thread::sleep(Duration::from_secs(remaining_time));
+            }
         };
     }
 }
