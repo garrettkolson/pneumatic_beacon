@@ -58,12 +58,14 @@ fn listen_for_requests(beacon: Arc<Beacon>) {
 
 fn check_node_heartbeats(beacon: Arc<Beacon>) {
     let mut checking = true;
-    let beacon_clone = Arc::clone(&beacon);
-
     while checking {
         let start = SystemTime::now();
-        match beacon_clone.check_heartbeats() {
-            HeartbeatResult::Err(HeartbeatError::ConnectionError) => checking = false,
+        match beacon.check_heartbeats() {
+            HeartbeatResult::Err(HeartbeatError::ConnectionError) => {
+                checking = false;
+                // TODO: log these errors
+                panic!("fatal error in checking for node heartbeats");
+            },
             _ => {
                 let mut remaining_time = HEARTBEAT_DURATION_IN_SECS;
                 if let Ok(elapsed) = start.elapsed() {
