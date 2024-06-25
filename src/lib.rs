@@ -1,5 +1,4 @@
 use std::net::{Ipv6Addr, SocketAddrV6};
-use std::str::FromStr;
 use std::sync::Arc;
 use dashmap::DashMap;
 use pneumatic_core::{conns, encoding, node::*};
