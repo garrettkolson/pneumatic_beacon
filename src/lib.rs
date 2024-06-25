@@ -22,6 +22,10 @@ impl Beacon {
         }
     }
 
+    pub fn check_heartbeats(&self) -> HeartbeatResult {
+        HeartbeatResult::Ok
+    }
+
     pub fn handle_request(&self, data: Vec<u8>){
         // TODO: log failed deserializations
         let request = match encoding::deserialize_rmp_to::<NodeRequest>(data) {
@@ -30,9 +34,15 @@ impl Beacon {
         };
 
         match request.request_type {
+            NodeRequestType::Heartbeat => self.respond_with_heartbeat(request),
             NodeRequestType::Register => self.register_node(request),
             NodeRequestType::Request => self.request_node(request)
         }
+    }
+
+    // TODO: need to probably pass the TcpStream through here to properly respond
+    fn respond_with_heartbeat(&self, request: NodeRequest) {
+        todo!()
     }
 
     fn register_node(&self, request: NodeRequest) {
@@ -70,10 +80,6 @@ impl Beacon {
             let sender = self.conn_factory.get_faf_sender();
             sender.send_to_v6(addr, &*data);
         }
-    }
-
-    pub fn check_heartbeats(&self) -> HeartbeatResult {
-        HeartbeatResult::Ok
     }
 }
 
