@@ -65,6 +65,8 @@ impl Beacon {
             let _ = handle.join();
         }
 
+        // TODO: if more nodes are needed, send out requests
+
         HeartbeatResult::Ok
     }
 
@@ -134,6 +136,7 @@ impl Beacon {
 
 pub enum HeartbeatResult {
     Ok,
+    NodesNeeded(Vec<NodeRegistryType>),
     Err(HeartbeatError)
 }
 

@@ -70,7 +70,7 @@ fn check_node_heartbeats(beacon: Arc<Beacon>) {
             if let Ok(elapsed) = start.elapsed() {
                 let elapsed_secs = elapsed.as_secs() as i64;
                 remaining_time = remaining_time - elapsed_secs;
-                if remaining_time >= 0 { continue; }
+                if remaining_time <= 0 { continue; }
             }
             thread::sleep(Duration::from_secs(remaining_time as u64));
         }
