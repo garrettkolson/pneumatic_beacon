@@ -30,6 +30,8 @@ fn main() {
     heartbeat_thread.join().unwrap();
 }
 
+// TODO: make a loopback local server for node address requests from the local node processes
+
 fn listen_for_requests(beacon: Arc<Beacon>) {
     // todo: make listener address, thread count configurable by loading from config.json
     let listener = TcpListener::bind("127.0.0.1:7878")
