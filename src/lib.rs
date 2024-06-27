@@ -1,81 +1,108 @@
-use std::net::{Ipv6Addr, SocketAddrV6};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use dashmap::DashMap;
 use pneumatic_core::{conns, encoding, node::*};
 use pneumatic_core::conns::Sender;
+use strum::IntoEnumIterator;
 
 pub struct Beacon {
-    committers: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
-    sentinels: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
-    executors: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
-    finalizers: Arc<DashMap<Vec<u8>, Ipv6Addr>>,
-    conn_factory: Arc<Box<dyn conns::ConnFactory>>
+    committers: Arc<DashMap<Vec<u8>, IpAddr>>,
+    sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
+    executors: Arc<DashMap<Vec<u8>, IpAddr>>,
+    finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
+    conn_factory: Arc<Box<dyn conns::ConnFactory>>,
+    type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>
 }
 
 impl Beacon {
+
+    ///////////// factory methods //////////////
+
     pub fn with_factory(conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
         Beacon {
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
-            conn_factory: Arc::new(conn_factory)
+            conn_factory: Arc::new(conn_factory),
+            type_configs: Arc::new(DashMap::new())
         }
     }
 
+    /////////////// heartbeats /////////////////
+
     pub fn check_heartbeats(&self) -> HeartbeatResult {
-
-        // TODO: decide how to remove unresponsive nodes from collections
-        let mut handles: Vec<JoinHandle<_>> = vec![];
-        for committer in self.committers.iter() {
-            let (conn, addr) = self.get_heartbeat_conn(committer.value().clone());
-
-            handles.push(thread::spawn(move || {
-                let response = conn.get_response_from_v6(addr, &[1u8]);
-            }));
+        for node_type in NodeRegistryType::iter() {
+            if let HeartbeatResult::NodesNeeded(n) = self.check_nodes(node_type) {
+                self.broadcast_node_request(&n);
+            }
         }
-
-        for sentinel in self.sentinels.iter() {
-            let (conn, addr) = self.get_heartbeat_conn(sentinel.value().clone());
-
-            handles.push(thread::spawn(move || {
-                let response = conn.get_response_from_v6(addr, &[1u8]);
-            }));
-        }
-
-        for executor in self.executors.iter() {
-            let (conn, addr) = self.get_heartbeat_conn(executor.value().clone());
-
-            handles.push(thread::spawn(move || {
-                let response = conn.get_response_from_v6(addr, &[1u8]);
-            }));
-        }
-
-        for finalizer in self.finalizers.iter() {
-            let (conn, addr) = self.get_heartbeat_conn(finalizer.value().clone());
-
-            handles.push(thread::spawn(move || {
-                let response = conn.get_response_from_v6(addr, &[1u8]);
-            }));
-        }
-
-        for handle in handles {
-            let _ = handle.join();
-        }
-
-        // TODO: if more nodes are needed, send out requests
 
         HeartbeatResult::Ok
     }
 
-    fn get_heartbeat_conn(&self, node_addr: Ipv6Addr) -> (Box<dyn Sender>, SocketAddrV6) {
+    fn check_nodes(&self, node_type: NodeRegistryType) -> HeartbeatResult {
+        let nodes = match self.get_nodes(&node_type) {
+            Some(n) => n,
+            None => return HeartbeatResult::Ok
+        };
+
+        let mut handles: Vec<JoinHandle<Heartbeat>> = vec![];
+        for node in nodes.iter() {
+            let (conn, addr) = self.get_heartbeat_conn(node.value().clone());
+            let node_key = node.key().clone();
+
+            handles.push(thread::spawn(move || {
+                match conn.get_response(addr, &[1u8]) {
+                    Ok(_) => Heartbeat::Alive(node_key),
+                    Err(_) => Heartbeat::Dead(node_key)
+                }
+            }));
+        }
+
+        for handle in handles {
+            if let Ok(Heartbeat::Dead(node_key)) = handle.join() {
+                nodes.remove(&node_key);
+            }
+        }
+
+        let min = self.get_min_node_number(&node_type);
+        match nodes.len() {
+            n if n >= min => HeartbeatResult::Ok,
+            _ => HeartbeatResult::NodesNeeded(node_type)
+        }
+    }
+
+    fn broadcast_node_request(&self, node_type: &NodeRegistryType) {
+
+    }
+
+    fn get_heartbeat_conn(&self, node_addr: IpAddr) -> (Box<dyn Sender>, SocketAddr) {
         let factory = Arc::clone(&self.conn_factory);
         let conn = factory.get_sender();
-        let addr = SocketAddrV6::new(node_addr, conns::HEARTBEAT_PORT, 0, 0);
+        let addr = SocketAddr::new(node_addr, conns::HEARTBEAT_PORT);
         (conn, addr)
     }
+    fn get_nodes(&self, node_registry_type: &NodeRegistryType) -> Option<Nodes> {
+        match node_registry_type {
+            NodeRegistryType::Committer => Some(Arc::clone(&self.committers)),
+            NodeRegistryType::Sentinel => Some(Arc::clone(&self.sentinels)),
+            NodeRegistryType::Executor => Some(Arc::clone(&self.executors)),
+            NodeRegistryType::Finalizer => Some(Arc::clone(&self.finalizers)),
+            _ => None
+        }
+    }
+
+    fn get_min_node_number(&self, node_type: &NodeRegistryType) -> usize {
+        match self.type_configs.get(node_type) {
+            Some(node) => node.min,
+            None => 0
+        }
+    }
+
+    //////////// external requests //////////////
 
     pub fn handle_request(&self, data: Vec<u8>){
         // TODO: log failed deserializations
@@ -97,16 +124,11 @@ impl Beacon {
     }
 
     fn register_node(&self, request: NodeRequest) {
+        // TODO: have to make these checks more robust before allowing the registration
         for node_type in request.requester_types {
-            let nodes = match node_type {
-                NodeRegistryType::Committer => Arc::clone(&self.committers),
-                NodeRegistryType::Sentinel => Arc::clone(&self.sentinels),
-                NodeRegistryType::Executor => Arc::clone(&self.executors),
-                NodeRegistryType::Finalizer => Arc::clone(&self.finalizers),
-                _ => continue
+            if let Some(nodes) = self.get_nodes(&node_type) {
+                nodes.insert(request.requester_key.clone(), request.requester_ip.clone());
             };
-
-            nodes.insert(request.requester_key.clone(), request.requester_ip.clone());
         }
     }
 
@@ -127,27 +149,40 @@ impl Beacon {
         };
 
         for node in nodes.iter() {
-            let addr = SocketAddrV6::new(node.value().clone(), port, 0, 0);
+            let addr = SocketAddr::new(node.value().clone(), port);
             let sender = self.conn_factory.get_faf_sender();
-            sender.send_to_v6(addr, &*data);
+            sender.send(addr, &*data);
         }
     }
 }
 
+pub type Nodes = Arc<DashMap<Vec<u8>, IpAddr>>;
+
+pub enum Heartbeat {
+    Alive(Vec<u8>),
+    Dead(Vec<u8>)
+}
+
 pub enum HeartbeatResult {
     Ok,
-    NodesNeeded(Vec<NodeRegistryType>),
+    NodesNeeded(NodeRegistryType),
     Err(HeartbeatError)
 }
 
 pub enum HeartbeatError {
     NoNodesConnected,
-    ConnectionError
+    ConnectionError,
+    IncorrectNodeType
+}
+
+struct NodeTypeConfig {
+    min: usize,
+    max: usize
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{SocketAddrV4, SocketAddrV6};
+    use std::net::{SocketAddr};
     use pneumatic_core::conns::{ConnFactory, Sender, FireAndForgetSender, ConnError};
 
     // TODO: write the tests
@@ -157,11 +192,7 @@ mod tests {
     }
 
     impl FireAndForgetSender for SendFakeStuff {
-        fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]) {
-            todo!()
-        }
-
-        fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]) {
+        fn send(&self, addr: SocketAddr, data: &[u8]) {
             todo!()
         }
     }
@@ -171,11 +202,7 @@ mod tests {
     }
 
     impl Sender for SendStuff {
-        fn get_response_from_v4(&self, addr: SocketAddrV4, data: &[u8]) -> Result<Vec<u8>, ConnError> {
-            todo!()
-        }
-
-        fn get_response_from_v6(&self, addr: SocketAddrV6, data: &[u8]) -> Result<Vec<u8>, ConnError> {
+        fn get_response(&self, addr: SocketAddr, data: &[u8]) -> Result<Vec<u8>, ConnError> {
             todo!()
         }
     }
