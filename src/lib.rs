@@ -3,31 +3,31 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use dashmap::DashMap;
-use pneumatic_core::{conns, encoding, node::*};
-use pneumatic_core::conns::Sender;
+use pneumatic_core::{config, conns, encoding, node::*};
+use pneumatic_core::conns::{FireAndForgetSender, Sender};
 use strum::IntoEnumIterator;
 
 pub struct Beacon {
+    config: config::Config,
     committers: Arc<DashMap<Vec<u8>, IpAddr>>,
     sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
     executors: Arc<DashMap<Vec<u8>, IpAddr>>,
     finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
     conn_factory: Arc<Box<dyn conns::ConnFactory>>,
-    type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>
 }
 
 impl Beacon {
 
     ///////////// factory methods //////////////
 
-    pub fn with_factory(conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
+    pub fn init(config: config::Config, conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
         Beacon {
+            config,
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
             conn_factory: Arc::new(conn_factory),
-            type_configs: Arc::new(DashMap::new())
         }
     }
 
@@ -55,7 +55,8 @@ impl Beacon {
             let node_key = node.key().clone();
 
             handles.push(thread::spawn(move || {
-                match conn.get_response(addr, &[1u8]) {
+                let heartbeat = Self::get_heartbeat();
+                match conn.get_response(addr, &heartbeat) {
                     Ok(_) => Heartbeat::Alive(node_key),
                     Err(_) => Heartbeat::Dead(node_key)
                 }
@@ -65,6 +66,8 @@ impl Beacon {
         for handle in handles {
             if let Ok(Heartbeat::Dead(node_key)) = handle.join() {
                 nodes.remove(&node_key);
+                // TODO: write something here to PUSH heartbeat failure to local processes
+                // TODO: so they can remove that node from their local lists
             }
         }
 
@@ -76,7 +79,29 @@ impl Beacon {
     }
 
     fn broadcast_node_request(&self, node_type: &NodeRegistryType) {
+        let mut handles: Vec<JoinHandle<_>> = vec![];
+        for n in NodeRegistryType::iter() {
+            let nodes = match self.get_nodes(&n) {
+                Some(nodes) => nodes,
+                None => continue
+            };
 
+            for node in nodes.iter() {
+                let (conn, addr) = self.get_broadcast_conn(node.value().clone());
+                let request = self.get_broadcast_request(node_type);
+
+                handles.push(thread::spawn(move || {
+                    if let Ok(data) = encoding::serialize_to_bytes_rmp(request) {
+                        // TODO: this needs to get the response back to add those nodes to the local list
+                        conn.send(addr, &data);
+                    }
+                }));
+            }
+        }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 
     fn get_heartbeat_conn(&self, node_addr: IpAddr) -> (Box<dyn Sender>, SocketAddr) {
@@ -85,6 +110,24 @@ impl Beacon {
         let addr = SocketAddr::new(node_addr, conns::HEARTBEAT_PORT);
         (conn, addr)
     }
+
+    fn get_broadcast_conn(&self, node_addr: IpAddr) -> (Box<dyn FireAndForgetSender>, SocketAddr) {
+        let factory = Arc::clone(&self.conn_factory);
+        let conn = factory.get_faf_sender();
+        let addr = SocketAddr::new(node_addr, conns::BEACON_PORT);
+        (conn, addr)
+    }
+
+    fn get_broadcast_request(&self, node_type: &NodeRegistryType) -> NodeRequest {
+        NodeRequest {
+            requested_type: node_type.clone(),
+            requester_ip: self.config.ip_address.clone(),
+            requester_key: self.config.public_key.clone(),
+            requester_types: vec![],
+            request_type: NodeRequestType::Request
+        }
+    }
+
     fn get_nodes(&self, node_registry_type: &NodeRegistryType) -> Option<Nodes> {
         match node_registry_type {
             NodeRegistryType::Committer => Some(Arc::clone(&self.committers)),
@@ -96,7 +139,7 @@ impl Beacon {
     }
 
     fn get_min_node_number(&self, node_type: &NodeRegistryType) -> usize {
-        match self.type_configs.get(node_type) {
+        match self.config.type_configs.get(node_type) {
             Some(node) => node.min,
             None => 0
         }
@@ -104,55 +147,59 @@ impl Beacon {
 
     //////////// external requests //////////////
 
-    pub fn handle_request(&self, data: Vec<u8>){
-        // TODO: log failed deserializations
+    pub fn handle_request(&self, data: Vec<u8>) -> Vec<u8> {
         let request = match encoding::deserialize_rmp_to::<NodeRequest>(data) {
             Ok(req) => req,
-            Err(_) => return
+            Err(_) => return Self::get_heartbeat()
         };
 
         match request.request_type {
             NodeRequestType::Register => self.register_node(request),
             NodeRequestType::Request => self.request_node(request),
-            _ => return
+            NodeRequestType::Heartbeat => Self::get_heartbeat()
         }
     }
 
-    // TODO: put this in pneumatic_node
-    fn respond_with_heartbeat(&self, request: NodeRequest) {
-        todo!()
-    }
-
-    fn register_node(&self, request: NodeRequest) {
+    fn register_node(&self, request: NodeRequest) -> Vec<u8> {
         // TODO: have to make these checks more robust before allowing the registration
         for node_type in request.requester_types {
             if let Some(nodes) = self.get_nodes(&node_type) {
                 nodes.insert(request.requester_key.clone(), request.requester_ip.clone());
+                // TODO: write something to PUSH this registration to local processes
             };
         }
+
+        // TODO: fix this to return something meaningful
+        vec![]
     }
 
-    fn request_node(&self, request: NodeRequest) {
+    fn request_node(&self, request: NodeRequest) -> Vec<u8> {
+        // TODO: need to redo this to just return serialized list of requested type
         // TODO: log non-matched type requests
-        let (nodes, port) = match request.requested_type {
-            NodeRegistryType::Committer => (Arc::clone(&self.committers), conns::COMMITTER_PORT),
-            NodeRegistryType::Sentinel => (Arc::clone(&self.sentinels), conns::SENTINEL_PORT),
-            NodeRegistryType::Executor => (Arc::clone(&self.executors), conns::EXECUTOR_PORT),
-            NodeRegistryType::Finalizer => (Arc::clone(&self.finalizers), conns::FINALIZER_PORT),
-            _ => return
-        };
+        // let (nodes, port) = match request.requested_type {
+        //     NodeRegistryType::Committer => (Arc::clone(&self.committers), conns::COMMITTER_PORT),
+        //     NodeRegistryType::Sentinel => (Arc::clone(&self.sentinels), conns::SENTINEL_PORT),
+        //     NodeRegistryType::Executor => (Arc::clone(&self.executors), conns::EXECUTOR_PORT),
+        //     NodeRegistryType::Finalizer => (Arc::clone(&self.finalizers), conns::FINALIZER_PORT),
+        //     _ => return
+        // };
+        //
+        // // TODO: log serialization errors
+        // let data = match encoding::serialize_to_bytes_rmp(request) {
+        //     Ok(d) => d,
+        //     Err(_) => return
+        // };
+        //
+        // for node in nodes.iter() {
+        //     let addr = SocketAddr::new(node.value().clone(), port);
+        //     let sender = self.conn_factory.get_faf_sender();
+        //     sender.send(addr, &*data);
+        // }
+        todo!()
+    }
 
-        // TODO: log serialization errors
-        let data = match encoding::serialize_to_bytes_rmp(request) {
-            Ok(d) => d,
-            Err(_) => return
-        };
-
-        for node in nodes.iter() {
-            let addr = SocketAddr::new(node.value().clone(), port);
-            let sender = self.conn_factory.get_faf_sender();
-            sender.send(addr, &*data);
-        }
+    fn get_heartbeat() -> Vec<u8> {
+        vec![1u8]
     }
 }
 
@@ -173,11 +220,6 @@ pub enum HeartbeatError {
     NoNodesConnected,
     ConnectionError,
     IncorrectNodeType
-}
-
-struct NodeTypeConfig {
-    min: usize,
-    max: usize
 }
 
 #[cfg(test)]

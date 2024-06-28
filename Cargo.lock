@@ -120,7 +120,7 @@ dependencies = [
 [[package]]
 name = "pneumatic_core"
 version = "0.1.0"
-source = "git+https://github.com/garrettkolson/pneumatic_core.git#7897d9081e75387a9e0d8b833b61a505051e9aff"
+source = "git+https://github.com/garrettkolson/pneumatic_core.git#cbee577d5f97d49eb25182a6027ec70322989edc"
 dependencies = [
  "dashmap",
  "rmp-serde",

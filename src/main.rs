@@ -1,8 +1,9 @@
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::net::{TcpListener};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
+use pneumatic_core::config::Config;
 use pneumatic_core::conns::TcpConnFactory;
 use pneumatic_core::server;
 use pneumatic_beacon::{Beacon, HeartbeatError, HeartbeatResult};
@@ -11,11 +12,14 @@ const SERVER_THREAD_COUNT: usize = 100;
 const HEARTBEAT_DURATION_IN_SECS: u64 = 60;
 
 fn main() {
-    let conn_factory = Box::new(TcpConnFactory::new());
-    let beacon = Arc::new(Beacon::with_factory(conn_factory));
+    let config = match Config::build() {
+        Ok(c) => c,
+        Err(err) => panic!("{}", err.message)
+    };
 
-    // TODO: have to make a tx/rx to let either thread know if there's a problem with the other?
-    // TODO: or do we just panic?
+    let conn_factory = Box::new(TcpConnFactory::new());
+    let beacon = Arc::new(Beacon::init(config, conn_factory));
+
     let request_beacon = Arc::clone(&beacon);
     let request_thread = thread::spawn(move || {
         listen_for_requests(request_beacon);
@@ -29,8 +33,6 @@ fn main() {
     request_thread.join().unwrap();
     heartbeat_thread.join().unwrap();
 }
-
-// TODO: make a loopback local server for node address requests from the local node processes
 
 fn listen_for_requests(beacon: Arc<Beacon>) {
     // todo: make listener address, thread count configurable by loading from config.json
@@ -49,7 +51,8 @@ fn listen_for_requests(beacon: Arc<Beacon>) {
                 let _ = pool.execute(move || {
                     let buf_reader = BufReader::new(&mut stream);
                     let raw_data = buf_reader.buffer().to_vec();
-                    safe_beacon.handle_request(raw_data);
+                    let response = safe_beacon.handle_request(raw_data);
+                    stream.write_all(&response).unwrap()
                 });
             },
             // TODO: log bad requests?
