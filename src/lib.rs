@@ -1,5 +1,6 @@
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::fmt::format;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
 use dashmap::DashMap;
@@ -51,7 +52,7 @@ impl Beacon {
 
         let mut handles: Vec<JoinHandle<Heartbeat>> = vec![];
         for node in nodes.iter() {
-            let (conn, addr) = self.get_heartbeat_conn(node.value().clone());
+            let (conn, addr) = self.get_conn_and_addr(node.value().clone(), conns::HEARTBEAT_PORT);
             let node_key = node.key().clone();
 
             handles.push(thread::spawn(move || {
@@ -63,12 +64,18 @@ impl Beacon {
             }));
         }
 
+        let mut dead_nodes: Vec<InternalRegistration> = vec![];
         for handle in handles {
             if let Ok(Heartbeat::Dead(node_key)) = handle.join() {
                 nodes.remove(&node_key);
-                // TODO: write something here to PUSH heartbeat failure to local processes
-                // TODO: so they can remove that node from their local lists
+                dead_nodes.push(
+                    InternalRegistration::for_removal(node_key, vec![ node_type.clone() ]));
             }
+        }
+
+        if dead_nodes.len() > 0 {
+            let batch = InternalRegistrationBatch::Remove(dead_nodes);
+            self.push_registration_update(batch);
         }
 
         let min = self.get_min_node_number(&node_type);
@@ -78,25 +85,16 @@ impl Beacon {
         }
     }
 
-    fn broadcast_node_request(&self, node_type: &NodeRegistryType) {
-        let mut handles: Vec<JoinHandle<_>> = vec![];
-        for n in NodeRegistryType::iter() {
-            let nodes = match self.get_nodes(&n) {
-                Some(nodes) => nodes,
-                None => continue
-            };
+    fn push_registration_update(&self, batch: InternalRegistrationBatch) {
+        let data = Arc::new(RwLock::new(encoding::serialize_to_bytes_rmp(&batch)
+            .expect("Fatal serialization error pushing registration update")));
 
-            for node in nodes.iter() {
-                let (conn, addr) = self.get_broadcast_conn(node.value().clone());
-                let request = self.get_broadcast_request(node_type);
-
-                handles.push(thread::spawn(move || {
-                    if let Ok(data) = encoding::serialize_to_bytes_rmp(request) {
-                        // TODO: this needs to get the response back to add those nodes to the local list
-                        conn.send(addr, &data);
-                    }
-                }));
-            }
+        let addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let mut handles: Vec<JoinHandle<Vec<u8>>> = vec![];
+        for n_type in &self.config.node_registry_types {
+            let cloned_data = Arc::clone(&data);
+            let (conn, socket) = self.get_conn_and_addr(addr, conns::get_internal_port(n_type));
+            handles.push(Self::send_on_thread(cloned_data, conn, socket));
         }
 
         for handle in handles {
@@ -104,17 +102,49 @@ impl Beacon {
         }
     }
 
-    fn get_heartbeat_conn(&self, node_addr: IpAddr) -> (Box<dyn Sender>, SocketAddr) {
-        let factory = Arc::clone(&self.conn_factory);
-        let conn = factory.get_sender();
-        let addr = SocketAddr::new(node_addr, conns::HEARTBEAT_PORT);
-        (conn, addr)
+    fn broadcast_node_request(&self, node_type: &NodeRegistryType) {
+        let request = self.get_broadcast_request(node_type);
+        let data = Arc::new(RwLock::new(encoding::serialize_to_bytes_rmp(request)
+            .expect("Fatal serialization error broadcasting node request")));
+
+        let mut handles: Vec<JoinHandle<Vec<u8>>> = vec![];
+        for n in NodeRegistryType::iter() {
+            let nodes = match self.get_nodes(&n) {
+                Some(nodes) => nodes,
+                None => continue
+            };
+
+            for node in nodes.iter() {
+                let cloned_data = Arc::clone(&data);
+                let (conn, addr) = self.get_conn_and_addr(node.value().clone(), conns::BEACON_PORT);
+                handles.push(Self::send_on_thread(cloned_data, conn, addr));
+            }
+        }
+
+        // TODO: this needs to get the response back to add those nodes to the local list
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 
-    fn get_broadcast_conn(&self, node_addr: IpAddr) -> (Box<dyn FireAndForgetSender>, SocketAddr) {
+    // TODO: move this to core conns module
+    fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, addr: SocketAddr)
+        -> JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            match cloned_data.read() {
+                Err(_) => vec![],
+                Ok(read_data) => {
+                    conn.get_response(addr, &read_data)
+                        .unwrap_or_else(|_| vec![])
+                }
+            }
+        })
+    }
+
+    fn get_conn_and_addr(&self, node_addr: IpAddr, port: u16) -> (Box<dyn Sender>, SocketAddr) {
         let factory = Arc::clone(&self.conn_factory);
-        let conn = factory.get_faf_sender();
-        let addr = SocketAddr::new(node_addr, conns::BEACON_PORT);
+        let conn = factory.get_sender();
+        let addr = SocketAddr::new(node_addr, port);
         (conn, addr)
     }
 

@@ -12,10 +12,8 @@ const SERVER_THREAD_COUNT: usize = 100;
 const HEARTBEAT_DURATION_IN_SECS: u64 = 60;
 
 fn main() {
-    let config = match Config::build() {
-        Ok(c) => c,
-        Err(err) => panic!("{}", err.message)
-    };
+    let config = Config::build()
+        .expect("Couldn't build node config for beacon");
 
     let conn_factory = Box::new(TcpConnFactory::new());
     let beacon = Arc::new(Beacon::init(config, conn_factory));
