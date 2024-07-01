@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use dashmap::DashMap;
 use pneumatic_core::{config, conns, encoding, node::*};
 use pneumatic_core::conns::{Sender};
+use pneumatic_core::data::DataProvider;
 use strum::IntoEnumIterator;
 
 pub struct Beacon {
@@ -14,6 +15,7 @@ pub struct Beacon {
     executors: Arc<DashMap<Vec<u8>, IpAddr>>,
     finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
     conn_factory: Arc<Box<dyn conns::ConnFactory>>,
+    data_provider: DataProvider
 }
 
 impl Beacon {
@@ -21,6 +23,7 @@ impl Beacon {
     ///////////// factory methods //////////////
 
     pub fn init(config: config::Config, conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
+        let data_provider = DataProvider::from_config(&config);
         Beacon {
             config,
             committers: Arc::new(DashMap::new()),
@@ -28,6 +31,7 @@ impl Beacon {
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
             conn_factory: Arc::new(conn_factory),
+            data_provider
         }
     }
 
@@ -168,11 +172,13 @@ impl Beacon {
         }
     }
 
+    // TODO: what about doing this with a validator trait?
     fn verify_node(&self, node_type: &NodeRegistryType, key: &Vec<u8>) -> bool {
         if self.node_is_already_registered(key, node_type) { return false; }
         if self.type_is_maxed_out(node_type) { return false; }
 
-        // TODO: have to verify that this node has the proper minimum balance for this type
+        // TODO: have to verify that this node has the proper minimum balance for this type?
+        // TODO: or just have the node functions do this, because a DataProvider is required?
 
         true
     }
