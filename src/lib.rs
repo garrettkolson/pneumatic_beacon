@@ -1,4 +1,3 @@
-use std::fmt::format;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -94,7 +93,7 @@ impl Beacon {
         for n_type in &self.config.node_registry_types {
             let cloned_data = Arc::clone(&data);
             let (conn, socket) = self.get_conn_and_addr(addr, conns::get_internal_port(n_type));
-            handles.push(Self::send_on_thread(cloned_data, conn, socket));
+            handles.push(conns::send_on_thread(cloned_data, conn, socket));
         }
 
         for handle in handles {
@@ -117,7 +116,7 @@ impl Beacon {
             for node in nodes.iter() {
                 let cloned_data = Arc::clone(&data);
                 let (conn, addr) = self.get_conn_and_addr(node.value().clone(), conns::BEACON_PORT);
-                handles.push(Self::send_on_thread(cloned_data, conn, addr));
+                handles.push(conns::send_on_thread(cloned_data, conn, addr));
             }
         }
 
@@ -125,20 +124,6 @@ impl Beacon {
         for handle in handles {
             let _ = handle.join();
         }
-    }
-
-    // TODO: move this to core conns module
-    fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, addr: SocketAddr)
-        -> JoinHandle<Vec<u8>> {
-        thread::spawn(move || {
-            match cloned_data.read() {
-                Err(_) => vec![],
-                Ok(read_data) => {
-                    conn.get_response(addr, &read_data)
-                        .unwrap_or_else(|_| vec![])
-                }
-            }
-        })
     }
 
     fn get_conn_and_addr(&self, node_addr: IpAddr, port: u16) -> (Box<dyn Sender>, SocketAddr) {
