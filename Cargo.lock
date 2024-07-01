@@ -120,7 +120,7 @@ dependencies = [
 [[package]]
 name = "pneumatic_core"
 version = "0.1.0"
-source = "git+https://github.com/garrettkolson/pneumatic_core.git#9d1aee886284ccfe0c0b52e2e23bcabbe40ef200"
+source = "git+https://github.com/garrettkolson/pneumatic_core.git#f6ab76971a477268a0f90cc1f0e210ca16fd722e"
 dependencies = [
  "dashmap",
  "rmp-serde",
@@ -219,9 +219,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.119"
+version = "1.0.120"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8eddb61f0697cc3989c5d64b452f5488e2b8a60fd7d5076a3045076ffef8cb0"
+checksum = "4e0d21c9a8cae1235ad58a00c11cb40d4b1e5c784f1ef2c537876ed6ffd8b7c5"
 dependencies = [
  "itoa",
  "ryu",
