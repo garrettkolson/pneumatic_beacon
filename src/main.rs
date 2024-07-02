@@ -1,10 +1,11 @@
+use std::fmt::format;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 use pneumatic_core::config::Config;
-use pneumatic_core::conns::TcpConnFactory;
+use pneumatic_core::conns::*;
 use pneumatic_core::server;
 use pneumatic_beacon::{Beacon, HeartbeatError, HeartbeatResult};
 
@@ -34,7 +35,7 @@ fn main() {
 
 fn listen_for_requests(beacon: Arc<Beacon>) {
     // todo: make listener address, thread count configurable by loading from config.json
-    let listener = TcpListener::bind("127.0.0.1:7878")
+    let listener = TcpListener::bind(format!("127.0.0.1:{BEACON_PORT}"))
         .expect("Couldn't set up listener for beacon");
 
     let pool = match server::ThreadPool::build(SERVER_THREAD_COUNT) {

@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
 use dashmap::DashMap;
-use pneumatic_core::{config, conns, encoding, node::*};
+use pneumatic_core::{config, conns, encoding::*, node::*};
 use pneumatic_core::conns::{Sender};
 use pneumatic_core::data::DataProvider;
 use strum::IntoEnumIterator;
@@ -38,10 +38,8 @@ impl Beacon {
     ////////////// public methods //////////////
 
     pub fn handle_request(&self, data: Vec<u8>) -> Vec<u8> {
-        let request = match encoding::deserialize_rmp_to::<NodeRequest>(data) {
-            Ok(req) => req,
-            Err(_) => return Self::get_heartbeat()
-        };
+        let Ok(request) = deserialize_rmp_to::<NodeRequest>(data)
+            else { return Self::get_heartbeat() };
 
         match request.request_type {
             NodeRequestType::Register => self.register_node(request),
@@ -51,11 +49,11 @@ impl Beacon {
     }
 
     pub fn check_heartbeats(&self) -> HeartbeatResult {
-        for node_type in NodeRegistryType::iter() {
-            if let HeartbeatResult::NodesNeeded(n) = self.check_nodes(node_type) {
+        let _: Vec<_> = NodeRegistryType::iter().map(|t| -> () {
+            if let HeartbeatResult::NodesNeeded(n) = self.check_nodes(t) {
                 self.broadcast_node_request(&n);
             }
-        }
+        }).collect();
 
         HeartbeatResult::Ok
     }
@@ -63,28 +61,25 @@ impl Beacon {
     /////////////// heartbeats /////////////////
 
     fn check_nodes(&self, node_type: NodeRegistryType) -> HeartbeatResult {
-        let nodes = match self.get_nodes(&node_type) {
-            Some(n) => n,
-            None => return HeartbeatResult::Ok
-        };
+        let Some(nodes) = self.get_nodes(&node_type)
+            else { return HeartbeatResult::Ok };
 
-        let mut handles: Vec<JoinHandle<Heartbeat>> = vec![];
-        for node in nodes.iter() {
+        let threads: Vec<JoinHandle<Heartbeat>> = nodes.iter().map(|node| -> JoinHandle<Heartbeat> {
             let (conn, addr) = self.get_conn_and_addr(node.value().clone(), conns::HEARTBEAT_PORT);
             let node_key = node.key().clone();
 
-            handles.push(thread::spawn(move || {
+            thread::spawn(move || {
                 let heartbeat = Self::get_heartbeat();
                 match conn.get_response(addr, &heartbeat) {
                     Ok(_) => Heartbeat::Alive(node_key),
                     Err(_) => Heartbeat::Dead(node_key)
                 }
-            }));
-        }
+            })
+        }).collect();
 
         let mut dead_nodes: Vec<InternalRegistration> = vec![];
-        for handle in handles {
-            if let Ok(Heartbeat::Dead(node_key)) = handle.join() {
+        for thread in threads {
+            if let Ok(Heartbeat::Dead(node_key)) = thread.join() {
                 nodes.remove(&node_key);
                 dead_nodes.push(
                     InternalRegistration::for_removal(node_key, vec![ node_type.clone() ]));
@@ -105,36 +100,27 @@ impl Beacon {
 
     fn broadcast_node_request(&self, node_type: &NodeRegistryType) {
         let request = self.get_broadcast_request(node_type);
-        let data = Arc::new(RwLock::new(encoding::serialize_to_bytes_rmp(request)
+        let data = Arc::new(RwLock::new(serialize_to_bytes_rmp(request)
             .expect("Fatal serialization error broadcasting node request")));
 
-        let mut handles: Vec<JoinHandle<Vec<u8>>> = vec![];
+        let mut threads: Vec<JoinHandle<Vec<u8>>> = vec![];
         for n in NodeRegistryType::iter() {
-            let nodes = match self.get_nodes(&n) {
-                Some(nodes) => nodes,
-                None => continue
-            };
+            let Some(nodes) = self.get_nodes(&n) else { continue };
 
             for node in nodes.iter() {
                 let cloned_data = Arc::clone(&data);
                 let (conn, addr) = self.get_conn_and_addr(node.value().clone(), conns::BEACON_PORT);
-                handles.push(conns::send_on_thread(cloned_data, conn, addr));
+                threads.push(conns::send_on_thread(cloned_data, conn, addr));
             }
         }
 
-        for handle in handles {
-            let response_data = match handle.join() {
-                Ok(d) => d,
-                Err(_) => continue
-            };
-
-            let response = match encoding::deserialize_rmp_to::<NodeRegistryResponse>(response_data) {
-                Ok(r) => r,
-                Err(_) => continue
-            };
+        threads.into_iter().for_each(|thread| -> () {
+            let Ok(response_data) = thread.join() else { return };
+            let Ok(response) = deserialize_rmp_to::<NodeRegistryResponse>(response_data)
+                else { return };
 
             self.handle_registry_response(node_type, response.entries);
-        }
+        })
     }
 
     //////////// registration //////////////
@@ -142,7 +128,7 @@ impl Beacon {
     fn register_node(&self, request: NodeRequest) -> Vec<u8> {
         for node_type in request.requester_types {
             if let Some(nodes) = self.get_nodes(&node_type) {
-                if !self.verify_node(&node_type, &request.requester_key) { continue; }
+                if !self.node_is_ok(&node_type, &request.requester_key) { continue; }
                 nodes.insert(request.requester_key.clone(), request.requester_ip.clone());
                 let reg = InternalRegistration::for_add(request.requester_key.clone(),
                                                         request.requester_ip.clone(),
@@ -159,7 +145,7 @@ impl Beacon {
         if let Some(nodes) = self.get_nodes(node_type) {
             let mut new_nodes: Vec<InternalRegistration> = vec![];
             for entry in entries {
-                if !self.verify_node(node_type, &entry.node_key) { continue; }
+                if !self.node_is_ok(node_type, &entry.node_key) { continue; }
                 nodes.insert(entry.node_key.clone(), entry.node_ip.clone());
                 new_nodes.push(
                     InternalRegistration::for_add(entry.node_key, entry.node_ip,
@@ -172,13 +158,11 @@ impl Beacon {
         }
     }
 
-    // TODO: what about doing this with a validator trait?
-    fn verify_node(&self, node_type: &NodeRegistryType, key: &Vec<u8>) -> bool {
+    fn node_is_ok(&self, node_type: &NodeRegistryType, key: &Vec<u8>) -> bool {
         if self.node_is_already_registered(key, node_type) { return false; }
         if self.type_is_maxed_out(node_type) { return false; }
 
         // TODO: have to verify that this node has the proper minimum balance for this type?
-        // TODO: or just have the node functions do this, because a DataProvider is required?
 
         true
     }
@@ -199,25 +183,24 @@ impl Beacon {
             }
         };
 
-        encoding::serialize_to_bytes_rmp(response)
+        serialize_to_bytes_rmp(response)
             .unwrap_or_else(|_| Self::get_heartbeat())
     }
 
     fn push_registration_update(&self, batch: InternalRegistrationBatch) {
-        let data = Arc::new(RwLock::new(encoding::serialize_to_bytes_rmp(&batch)
+        let data = Arc::new(RwLock::new(serialize_to_bytes_rmp(&batch)
             .expect("Fatal serialization error pushing registration update")));
 
         let addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        let mut handles: Vec<JoinHandle<Vec<u8>>> = vec![];
-        for n_type in &self.config.node_registry_types {
+        let threads: Vec<JoinHandle<Vec<u8>>> = self.config.node_registry_types.iter().map(|t| -> JoinHandle<Vec<u8>> {
             let cloned_data = Arc::clone(&data);
-            let (conn, socket) = self.get_conn_and_addr(addr, conns::get_internal_port(n_type));
-            handles.push(conns::send_on_thread(cloned_data, conn, socket));
-        }
+            let (conn, socket) = self.get_conn_and_addr(addr, conns::get_internal_port(t));
+            conns::send_on_thread(cloned_data, conn, socket)
+        }).collect();
 
-        for handle in handles {
-            let _ = handle.join();
-        }
+        threads.into_iter().for_each(|h| -> () {
+            let _ = h.join().unwrap_or_else(|_| vec![]);
+        });
     }
 
     ///////////////////// Common //////////////////////
