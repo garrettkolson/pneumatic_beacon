@@ -1,4 +1,3 @@
-use std::fmt::format;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener};
 use std::sync::Arc;
@@ -17,7 +16,8 @@ fn main() {
         .expect("Couldn't build node config for beacon");
 
     let conn_factory = Box::new(TcpConnFactory::new());
-    let beacon = Arc::new(Beacon::init(config, conn_factory));
+    let beacon = Beacon::init(config, conn_factory);
+    let beacon = Arc::new(beacon);
 
     let request_beacon = Arc::clone(&beacon);
     let request_thread = thread::spawn(move || {

@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use pneumatic_core::{config, conns, encoding::*, node::*};
 use pneumatic_core::conns::{Sender};
 use pneumatic_core::data::DataProvider;
+use pneumatic_core::user::User;
 use strum::IntoEnumIterator;
 
 pub struct Beacon {
@@ -15,7 +16,6 @@ pub struct Beacon {
     executors: Arc<DashMap<Vec<u8>, IpAddr>>,
     finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
     conn_factory: Arc<Box<dyn conns::ConnFactory>>,
-    data_provider: DataProvider
 }
 
 impl Beacon {
@@ -23,7 +23,6 @@ impl Beacon {
     ///////////// factory methods //////////////
 
     pub fn init(config: config::Config, conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
-        let data_provider = DataProvider::from_config(&config);
         Beacon {
             config,
             committers: Arc::new(DashMap::new()),
@@ -31,14 +30,13 @@ impl Beacon {
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
             conn_factory: Arc::new(conn_factory),
-            data_provider
         }
     }
 
     ////////////// public methods //////////////
 
     pub fn handle_request(&self, data: Vec<u8>) -> Vec<u8> {
-        let Ok(request) = deserialize_rmp_to::<NodeRequest>(data)
+        let Ok(request) = deserialize_rmp_to::<NodeRequest>(&data)
             else { return Self::get_heartbeat() };
 
         match request.request_type {
@@ -77,17 +75,17 @@ impl Beacon {
             })
         }).collect();
 
-        let mut dead_nodes: Vec<InternalRegistration> = vec![];
+        let mut dead_nodes: Vec<Registration> = vec![];
         for thread in threads {
             if let Ok(Heartbeat::Dead(node_key)) = thread.join() {
                 nodes.remove(&node_key);
                 dead_nodes.push(
-                    InternalRegistration::for_removal(node_key, vec![ node_type.clone() ]));
+                    Registration::for_removal(node_key, vec![ node_type.clone() ]));
             }
         }
 
         if dead_nodes.len() > 0 {
-            let batch = InternalRegistrationBatch::Remove(dead_nodes);
+            let batch = RegistrationBatch::Remove(dead_nodes);
             self.push_registration_update(batch);
         }
 
@@ -100,7 +98,7 @@ impl Beacon {
 
     fn broadcast_node_request(&self, node_type: &NodeRegistryType) {
         let request = self.get_broadcast_request(node_type);
-        let data = Arc::new(RwLock::new(serialize_to_bytes_rmp(request)
+        let data = Arc::new(RwLock::new(serialize_to_bytes_rmp(&request)
             .expect("Fatal serialization error broadcasting node request")));
 
         let mut threads: Vec<JoinHandle<Vec<u8>>> = vec![];
@@ -116,7 +114,7 @@ impl Beacon {
 
         threads.into_iter().for_each(|thread| -> () {
             let Ok(response_data) = thread.join() else { return };
-            let Ok(response) = deserialize_rmp_to::<NodeRegistryResponse>(response_data)
+            let Ok(response) = deserialize_rmp_to::<NodeRegistryResponse>(&response_data)
                 else { return };
 
             self.handle_registry_response(node_type, response.entries);
@@ -127,44 +125,66 @@ impl Beacon {
 
     fn register_node(&self, request: NodeRequest) -> Vec<u8> {
         for node_type in request.requester_types {
-            if let Some(nodes) = self.get_nodes(&node_type) {
-                if !self.node_is_ok(&node_type, &request.requester_key) { continue; }
-                nodes.insert(request.requester_key.clone(), request.requester_ip.clone());
-                let reg = InternalRegistration::for_add(request.requester_key.clone(),
-                                                        request.requester_ip.clone(),
-                                                        vec![ node_type ]);
-                let batch = InternalRegistrationBatch::Add(vec![reg]);
-                self.push_registration_update(batch);
-            };
+            let Some(nodes) = self.get_nodes(&node_type) else { continue };
+            if !self.node_is_ok(&node_type, &request.requester_key) { continue; }
+            let Ok(Some(registration)) = self.get_node_registration(nodes.clone(),
+                                                                &node_type,
+                                                                request.requester_key.clone(),
+                                                                request.requester_ip).join()
+                else { continue };
+            let batch = RegistrationBatch::Add(vec![registration]);
+            self.push_registration_update(batch);
         }
 
         Self::get_heartbeat()
     }
 
     fn handle_registry_response(&self, node_type: &NodeRegistryType, entries: Vec<NodeRegistryEntry>) {
-        if let Some(nodes) = self.get_nodes(node_type) {
-            let mut new_nodes: Vec<InternalRegistration> = vec![];
-            for entry in entries {
-                if !self.node_is_ok(node_type, &entry.node_key) { continue; }
-                nodes.insert(entry.node_key.clone(), entry.node_ip.clone());
-                new_nodes.push(
-                    InternalRegistration::for_add(entry.node_key, entry.node_ip,
-                                                  vec![ node_type.clone() ]));
-            }
+        let Some(nodes) = self.get_nodes(node_type) else { return };
+        let threads: Vec<JoinHandle<Option<Registration>>> = entries.into_iter()
+            .map(|entry| -> JoinHandle<Option<Registration>> {
+                if !self.node_is_ok(node_type, &entry.node_key) { return thread::spawn(|| return None) };
+                self.get_node_registration(nodes.clone(), node_type, entry.node_key, entry.node_ip)
+            })
+            .collect();
 
-            if new_nodes.len() == 0 { return; }
-            let batch = InternalRegistrationBatch::Add(new_nodes);
-            self.push_registration_update(batch);
+        let mut new_nodes: Vec<Registration> = vec![];
+        for thread in threads {
+            let Ok(Some(registration)) = thread.join() else { continue };
+            new_nodes.push(registration);
         }
+
+        if new_nodes.len() == 0 { return; }
+        let batch = RegistrationBatch::Add(new_nodes);
+        self.push_registration_update(batch);
     }
 
     fn node_is_ok(&self, node_type: &NodeRegistryType, key: &Vec<u8>) -> bool {
-        if self.node_is_already_registered(key, node_type) { return false; }
-        if self.type_is_maxed_out(node_type) { return false; }
+        !self.node_is_already_registered(key, node_type) && !self.type_is_maxed_out(node_type)
+    }
 
-        // TODO: have to verify that this node has the proper minimum balance for this type?
+    fn get_node_registration(&self, nodes: Nodes, node_type: &NodeRegistryType, key: Vec<u8>, ip: IpAddr)
+        -> JoinHandle<Option<Registration>> {
+        let environment_id = self.config.main_environment_id.clone();
+        let min_stake = self.get_min_type_stake(node_type);
+        let cloned_type = node_type.clone();
+        thread::spawn(move || {
+            match Self::check_db_node_user(&key, &environment_id, min_stake) {
+                false => None,
+                true => {
+                    nodes.insert(key.clone(), ip.clone());
+                    let reg = Registration::for_add(key, ip, vec![ cloned_type ]);
+                    Some(reg)
+                }
+            }
+        })
+    }
 
-        true
+    fn check_db_node_user(user_key: &Vec<u8>, environment_id: &str, min_stake: u64) -> bool {
+        let Ok(locked_token) = DataProvider::get_token(user_key, environment_id) else { return false };
+        let Ok(token) = locked_token.read() else { return false };
+        let Some(user) = token.get_asset::<User>() else { return false };
+        user.fuel_balance > min_stake
     }
 
     fn request_nodes(&self, request: NodeRequest) -> Vec<u8> {
@@ -183,20 +203,22 @@ impl Beacon {
             }
         };
 
-        serialize_to_bytes_rmp(response)
+        serialize_to_bytes_rmp(&response)
             .unwrap_or_else(|_| Self::get_heartbeat())
     }
 
-    fn push_registration_update(&self, batch: InternalRegistrationBatch) {
+    fn push_registration_update(&self, batch: RegistrationBatch) {
         let data = Arc::new(RwLock::new(serialize_to_bytes_rmp(&batch)
             .expect("Fatal serialization error pushing registration update")));
 
         let addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        let threads: Vec<JoinHandle<Vec<u8>>> = self.config.node_registry_types.iter().map(|t| -> JoinHandle<Vec<u8>> {
-            let cloned_data = Arc::clone(&data);
-            let (conn, socket) = self.get_conn_and_addr(addr, conns::get_internal_port(t));
-            conns::send_on_thread(cloned_data, conn, socket)
-        }).collect();
+        let threads: Vec<JoinHandle<Vec<u8>>> = self.config.node_registry_types.iter()
+            .map(|t| -> JoinHandle<Vec<u8>> {
+                let cloned_data = Arc::clone(&data);
+                let (conn, socket) = self.get_conn_and_addr(addr, conns::get_internal_port(t));
+                conns::send_on_thread(cloned_data, conn, socket)
+            })
+            .collect();
 
         threads.into_iter().for_each(|h| -> () {
             let _ = h.join().unwrap_or_else(|_| vec![]);
@@ -257,6 +279,13 @@ impl Beacon {
         match self.get_nodes(node_type) {
             Some(nodes) => nodes.len() >= self.get_max_node_number(node_type),
             None => true
+        }
+    }
+
+    fn get_min_type_stake(&self, node_type: &NodeRegistryType) -> u64 {
+        match self.config.type_configs.get(node_type) {
+            Some(config) => config.min_stake,
+            None => u64::MAX
         }
     }
 
