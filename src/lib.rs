@@ -11,10 +11,7 @@ use strum::IntoEnumIterator;
 
 pub struct Beacon {
     config: config::Config,
-    committers: Arc<DashMap<Vec<u8>, IpAddr>>,
-    sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
-    executors: Arc<DashMap<Vec<u8>, IpAddr>>,
-    finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
+    registry: NodeRegistry,
     conn_factory: Arc<Box<dyn conns::ConnFactory>>,
 }
 
@@ -25,10 +22,7 @@ impl Beacon {
     pub fn init(config: config::Config, conn_factory: Box<dyn conns::ConnFactory>) -> Beacon {
         Beacon {
             config,
-            committers: Arc::new(DashMap::new()),
-            sentinels: Arc::new(DashMap::new()),
-            executors: Arc::new(DashMap::new()),
-            finalizers: Arc::new(DashMap::new()),
+            registry: NodeRegistry::init(),
             conn_factory: Arc::new(conn_factory),
         }
     }
@@ -59,7 +53,7 @@ impl Beacon {
     /////////////// heartbeats /////////////////
 
     fn check_nodes(&self, node_type: NodeRegistryType) -> HeartbeatResult {
-        let Some(nodes) = self.get_nodes(&node_type)
+        let Some(nodes) = self.registry.get_nodes(&node_type)
             else { return HeartbeatResult::Ok };
 
         let threads: Vec<JoinHandle<Heartbeat>> = nodes.iter().map(|node| -> JoinHandle<Heartbeat> {
@@ -103,7 +97,7 @@ impl Beacon {
 
         let mut threads: Vec<JoinHandle<Vec<u8>>> = vec![];
         for n in NodeRegistryType::iter() {
-            let Some(nodes) = self.get_nodes(&n) else { continue };
+            let Some(nodes) = self.registry.get_nodes(&n) else { continue };
 
             for node in nodes.iter() {
                 let cloned_data = Arc::clone(&data);
@@ -125,7 +119,7 @@ impl Beacon {
 
     fn register_node(&self, request: NodeRequest) -> Vec<u8> {
         for node_type in request.requester_types {
-            let Some(nodes) = self.get_nodes(&node_type) else { continue };
+            let Some(nodes) = self.registry.get_nodes(&node_type) else { continue };
             if !self.node_is_ok(&node_type, &request.requester_key) { continue; }
             let Ok(Some(registration)) = self.get_node_registration(nodes.clone(),
                                                                 &node_type,
@@ -140,7 +134,7 @@ impl Beacon {
     }
 
     fn handle_registry_response(&self, node_type: &NodeRegistryType, entries: Vec<NodeRegistryEntry>) {
-        let Some(nodes) = self.get_nodes(node_type) else { return };
+        let Some(nodes) = self.registry.get_nodes(node_type) else { return };
         let threads: Vec<JoinHandle<Option<Registration>>> = entries.into_iter()
             .map(|entry| -> JoinHandle<Option<Registration>> {
                 if !self.node_is_ok(node_type, &entry.node_key) { return thread::spawn(|| return None) };
@@ -160,7 +154,7 @@ impl Beacon {
     }
 
     fn node_is_ok(&self, node_type: &NodeRegistryType, key: &Vec<u8>) -> bool {
-        !self.node_is_already_registered(key, node_type) && !self.type_is_maxed_out(node_type)
+        !self.registry.node_is_already_registered(key, node_type) && !self.type_is_maxed_out(node_type)
     }
 
     fn get_node_registration(&self, nodes: Nodes, node_type: &NodeRegistryType, key: Vec<u8>, ip: IpAddr)
@@ -192,7 +186,7 @@ impl Beacon {
             responder_key: self.config.public_key.clone(),
             responder_ip: self.config.ip_address.clone(),
             registry_type: request.requested_type.clone(),
-            entries: match self.get_nodes(&request.requested_type) {
+            entries: match self.registry.get_nodes(&request.requested_type) {
                 None => vec![],
                 Some(nodes) => nodes.iter().map(|n| {
                     NodeRegistryEntry {
@@ -244,23 +238,6 @@ impl Beacon {
         }
     }
 
-    fn get_nodes(&self, node_registry_type: &NodeRegistryType) -> Option<Nodes> {
-        match node_registry_type {
-            NodeRegistryType::Committer => Some(Arc::clone(&self.committers)),
-            NodeRegistryType::Sentinel => Some(Arc::clone(&self.sentinels)),
-            NodeRegistryType::Executor => Some(Arc::clone(&self.executors)),
-            NodeRegistryType::Finalizer => Some(Arc::clone(&self.finalizers)),
-            _ => None
-        }
-    }
-
-    fn node_is_already_registered(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> bool {
-        match self.get_nodes(node_type) {
-            Some(nodes) => nodes.contains_key(key),
-            None => false
-        }
-    }
-
     fn get_min_node_number(&self, node_type: &NodeRegistryType) -> usize {
         match self.config.type_configs.get(node_type) {
             Some(node) => node.min,
@@ -276,7 +253,7 @@ impl Beacon {
     }
 
     fn type_is_maxed_out(&self, node_type: &NodeRegistryType) -> bool {
-        match self.get_nodes(node_type) {
+        match self.registry.get_nodes(node_type) {
             Some(nodes) => nodes.len() >= self.get_max_node_number(node_type),
             None => true
         }
